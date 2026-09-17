@@ -22,6 +22,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { PromptExecutor, type PromptHost } from '@process/acp/session/PromptExecutor';
 import { AcpError } from '@process/acp/errors/AcpError';
+import { RequestError } from '@agentclientprotocol/sdk';
 import type { PromptContent } from '@process/acp/types';
 
 const FAST_RETRY = { attempts: 3, backoff: { initialMs: 0, maxMs: 0, factor: 1, jitter: 0 } };
@@ -402,5 +403,393 @@ describe('PromptExecutor - transient turn errors are retried (#774)', () => {
 
     await expect(shortLived.execute(CONTENT)).rejects.toBeInstanceOf(AcpError);
     expect(prompt).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * Fuigo 1.0.18 sends -32603 with object data `{ message, error_kind, http_status? }`. The user now sees
+ * `data.message`, so the replay decision can no longer ride on the JSON that used to leak into the message
+ * (`"http_status":503` matched `\b5\d\d\b`) — it reads the typed fields and the RAW pre-sanitisation text.
+ *
+ * The rule, as an allowlist: `idle_timeout` replays; `api` / `http` / `compaction` only report HOW the call
+ * failed (the provider's status, the transport, or Fuigo's own summariser call — never the prompt's verdict),
+ * so they are decided exactly as the same failure was before this branch (transient prose, or any 5xx);
+ * every other kind — `empty_response`, `rate_limited`, `auth`, `cancelled`, `session_unavailable`,
+ * `max_tokens_truncation`, `doom_loop_detected`, and anything this client has never heard of — is final.
+ * Untyped failures (a bare string, or an object with neither field) keep the prose match they had before.
+ */
+describe('PromptExecutor - typed engine error data decides replay explicitly', () => {
+  let host: ReturnType<typeof createHost>['host'];
+  let prompt: ReturnType<typeof vi.fn>;
+  let executor: PromptExecutor;
+
+  beforeEach(() => {
+    ({ host, prompt } = createHost());
+    executor = new PromptExecutor(host, 60_000, FAST_RETRY);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  /** A JSON-RPC -32603 as the SDK hands it to the client. */
+  const internal = (data: unknown) => new RequestError(-32603, 'Internal error', data);
+
+  /**
+   * Characterisation table. `base` is what this exact shape did BEFORE the typed-data branch
+   * (`TRANSIENT_DETAIL` over `Internal error: <JSON or string of data>`), proven by running this same
+   * table against `origin/main`. `now` is what it must do on this branch. A row where the two differ has
+   * to say why, in `divergence` — so a future edit that quietly changes a decision fails here rather than
+   * in someone's chat.
+   */
+  type ReplayDecision = 'replay' | 'final';
+  type Characterisation = {
+    name: string;
+    data: unknown;
+    base: ReplayDecision;
+    now: ReplayDecision;
+    divergence?: string;
+  };
+
+  const CHARACTERISATION: Characterisation[] = [
+    // --- Fuigo 1.0.18 typed shapes: transient-capable kinds -------------------------------------
+    {
+      name: 'api, overloaded (the copy Fuigo sends for 529 / overloaded_error)',
+      data: { message: 'Model is temporarily overloaded. Try again in a moment.', error_kind: 'api' },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'api, overloaded, with the 529 status attached',
+      data: {
+        message: 'Model is temporarily overloaded. Try again in a moment.',
+        error_kind: 'api',
+        http_status: 529,
+      },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'api, a provider stream error',
+      data: { message: 'api_error: Internal server error', error_kind: 'api' },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'api, a 5xx the prose does not mention',
+      data: { message: 'upstream request failed', error_kind: 'api', http_status: 503 },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'api, a 4xx whose prose is transient',
+      data: { message: 'request timed out', error_kind: 'api', http_status: 408 },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'http, a dropped connection with no status',
+      data: { message: 'connection closed before message completed', error_kind: 'http' },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'idle_timeout',
+      data: { message: 'No response from model for 90s — the model may be stuck', error_kind: 'idle_timeout' },
+      base: 'replay',
+      now: 'replay',
+    },
+
+    // --- Fuigo 1.0.18 typed shapes: final kinds ---------------------------------------------------
+    {
+      name: 'empty_response (reasoning_only)',
+      data: {
+        message: 'empty response from model (reasoning_only): model=m, had_reasoning=true, finish_reason=stop',
+        error_kind: 'empty_response',
+      },
+      base: 'final',
+      now: 'final',
+    },
+    {
+      name: 'empty_response after a proxy 503 replay storm',
+      data: {
+        message: 'empty response from model (no_visible_content): model=m, had_reasoning=true, finish_reason=stop',
+        error_kind: 'empty_response',
+        http_status: 503,
+      },
+      base: 'replay',
+      now: 'final',
+      divergence:
+        'the defect this branch exists for: an identical resend is served the same cached empty reply, 15 times over',
+    },
+    {
+      name: 'rate_limited',
+      data: { message: 'Rate limited', error_kind: 'rate_limited' },
+      base: 'final',
+      now: 'final',
+    },
+    {
+      name: 'auth',
+      data: { message: 'Authentication failed for provider', error_kind: 'auth' },
+      base: 'final',
+      now: 'final',
+    },
+    {
+      name: 'cancelled',
+      data: { message: 'request was cancelled', error_kind: 'cancelled' },
+      base: 'final',
+      now: 'final',
+    },
+    {
+      name: 'session_unavailable, whose prose reads transient',
+      data: { message: 'session temporarily unavailable', error_kind: 'session_unavailable' },
+      base: 'replay',
+      now: 'final',
+      divergence: 'the session actor is gone; the same prompt cannot reach it by being sent again',
+    },
+    {
+      name: 'max_tokens_truncation',
+      data: { message: 'response truncated: max output tokens reached', error_kind: 'max_tokens_truncation' },
+      base: 'final',
+      now: 'final',
+    },
+    {
+      name: 'doom_loop_detected',
+      data: { message: 'doom loop detected: the model repeated itself', error_kind: 'doom_loop_detected' },
+      base: 'final',
+      now: 'final',
+    },
+    {
+      name: 'an unknown kind, even with a 5xx and transient prose',
+      data: { message: 'connection reset', error_kind: 'brand_new_kind', http_status: 503 },
+      base: 'replay',
+      now: 'final',
+      divergence: 'the allowlist fails closed: a kind this client has never seen is a verdict until we know better',
+    },
+
+    // --- Fuigo 1.0.18 typed shapes: `compaction`, the recovery attempt's own failure -------------
+    // Shapes taken from Fuigo's source (`session_compact.rs` COMPACT_FAILED_PREFIX + the sampling
+    // error's Display, `acp_error::compaction`). Two compaction frames reach the PROMPT path and they
+    // are NOT the same shape:
+    //   - a compaction FAILURE is built by `acp_error::compaction()` (`sampler_turn.rs` ->
+    //     `run_compact_only` -> the compaction loop's last error) and carries exactly
+    //     `{ message, error_kind: 'compaction' }` — no `kind` field;
+    //   - a compaction CANCELLED under a running prompt is built by `CompactFailure::cancelled_error()`
+    //     (`session_compact.rs`), which goes through `compact_error_data(Cancelled, COMPACT_CANCELLED_MSG)`
+    //     and therefore DOES carry `kind: 'compact_cancelled'` next to `error_kind: 'cancelled'`.
+    //     `run_compact_only` returns that error unchanged, so the prompt sees the frame as built.
+    // `kind` also rides the separate `session/compact` RPC payload, where its values are the same
+    // `compact_failed` / `compact_cancelled`; the failure rows below carry no `kind` because the
+    // prompt path genuinely never sends one there. The verdict rides on `error_kind` either way.
+    // The kind says the SUMMARISER call failed, not what the prompt's verdict is, so — like `api`
+    // and `http` — the text decides, exactly as it decided on 1.0.17 when the same failure arrived
+    // untyped. A second compaction attempt is a different request, so a resend is a different roll.
+    {
+      name: 'compaction, a reset socket on the summariser call',
+      data: {
+        message: 'compact failed: request error: error sending request: connection reset by peer',
+        error_kind: 'compaction',
+      },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'compaction, a 503 from the summariser',
+      data: {
+        message: 'compact failed: API error (status 503 Service Unavailable): upstream connect error',
+        error_kind: 'compaction',
+      },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'compaction, the summariser stream going quiet',
+      data: {
+        message: 'compact failed: stream idle timeout after 90s (0 chars received)',
+        error_kind: 'compaction',
+      },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'compaction, an overloaded provider stream event',
+      data: {
+        message: 'compact failed: stream error (overloaded_error): Overloaded',
+        error_kind: 'compaction',
+      },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      // The shape whose accidental promotion to REPLAY re-creates the storm this whole change
+      // exists to stop: FluxRouter serves the identical resend the same cached empty reply, billed
+      // every time. Fuigo emits it as `compact failed: model returned empty response`
+      // (`compaction.rs`, `full_replace_compaction.rs`) and, through `classify_sampling_error`
+      // (`session_compact.rs`), as `compact failed: empty response from model (<reason>)`. Neither
+      // prose matches TRANSIENT_DETAIL today, so this is final on base and final now — the row is
+      // here so a later widening with a token like `empty` goes red instead of shipping.
+      name: 'compaction whose summariser came back empty — the one shape a widening must never replay',
+      data: { message: 'compact failed: model returned empty response', error_kind: 'compaction' },
+      base: 'final',
+      now: 'final',
+    },
+    {
+      name: 'compaction with nothing to compact — the prose was never transient',
+      data: { message: 'compact failed: nothing to compact', error_kind: 'compaction' },
+      base: 'final',
+      now: 'final',
+    },
+    {
+      name: 'compaction hitting the wall-clock backstop',
+      data: {
+        message: 'compact failed: exceeded wall-clock budget 300s (runaway generation)',
+        error_kind: 'compaction',
+      },
+      base: 'final',
+      now: 'final',
+    },
+    {
+      name: 'compaction cancelled — Fuigo tags the cancel `cancelled`, not `compaction`',
+      data: { kind: 'compact_cancelled', message: 'compact cancelled', error_kind: 'cancelled' },
+      base: 'final',
+      now: 'final',
+    },
+
+    // --- Fuigo <= 1.0.17 object shapes: `{ message, http_status }`, no kind ------------------------
+    {
+      name: 'status-only 502',
+      data: { message: 'upstream request failed', http_status: 502 },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'status-only 408 whose prose is transient',
+      data: { message: 'Request Timeout', http_status: 408 },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'an untyped object whose status is only in its JSON',
+      data: { message: 'provider hiccup', status: 503 },
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'an untyped object whose transient words are only adjacent across a newline',
+      data: { message: 'connection\nreset by peer' },
+      base: 'final',
+      now: 'final',
+    },
+
+    // --- Fuigo 1.0.16 string shapes ---------------------------------------------------------------
+    {
+      name: 'string data, empty response',
+      data: 'empty response from model (reasoning_only): model=m, had_reasoning=true, finish_reason=stop',
+      base: 'final',
+      now: 'final',
+    },
+    {
+      name: 'string data, overloaded',
+      data: 'Model is temporarily overloaded. Try again in a moment.',
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'string data, a dropped connection',
+      data: 'stream error: connection closed before message completed',
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'string data, an HTTP status in prose',
+      data: 'HTTP 503 Service Unavailable',
+      base: 'replay',
+      now: 'replay',
+    },
+    {
+      name: 'string data, rate limited',
+      data: 'Rate limited',
+      base: 'final',
+      now: 'final',
+    },
+  ];
+
+  for (const row of CHARACTERISATION) {
+    it(`${row.now === 'replay' ? 'replays' : 'does NOT replay'} ${row.name}`, async () => {
+      prompt.mockReset();
+      prompt.mockRejectedValueOnce(internal(row.data)).mockResolvedValue({ stopReason: 'end_turn' });
+
+      if (row.now === 'replay') {
+        await executor.execute(CONTENT);
+        expect(prompt).toHaveBeenCalledTimes(2);
+      } else {
+        await expect(executor.execute(CONTENT)).rejects.toBeInstanceOf(AcpError);
+        expect(prompt).toHaveBeenCalledTimes(1);
+      }
+    });
+  }
+
+  /**
+   * The table is the only thing pinning Wayland's model of Fuigo's compaction wire frames, so the
+   * frames themselves are pinned, not just their verdicts. Two shapes exist and they differ:
+   * `acp_error::compaction()` (the failure path, `compaction.rs` last error) sends
+   * `{ message, error_kind: 'compaction' }` with NO `kind`, while a compact cancelled under a running
+   * prompt comes from `CompactFailure::cancelled_error()` (`session_compact.rs`), which builds
+   * `compact_error_data(Cancelled, COMPACT_CANCELLED_MSG)` and therefore DOES carry
+   * `kind: 'compact_cancelled'` alongside `error_kind: 'cancelled'`. `run_compact_only` returns that
+   * error unchanged, so it reaches the prompt exactly as built.
+   */
+  it("models Fuigo's compaction frames exactly: only the cancelled one carries `kind`", () => {
+    const compactionRows = CHARACTERISATION.filter(
+      (row) =>
+        typeof row.data === 'object' &&
+        row.data !== null &&
+        'message' in row.data &&
+        String((row.data as { message: string }).message).startsWith('compact ')
+    );
+
+    const cancelled = compactionRows.find((row) => (row.data as { error_kind?: string }).error_kind === 'cancelled');
+    expect(cancelled?.data).toEqual({
+      kind: 'compact_cancelled',
+      message: 'compact cancelled',
+      error_kind: 'cancelled',
+    });
+
+    // Every other compaction row is the failure path, which sends no `kind` at all.
+    const failureRowsWithKind = compactionRows
+      .filter((row) => row !== cancelled && 'kind' in (row.data as object))
+      .map((row) => row.name);
+    expect(failureRowsWithKind).toEqual([]);
+  });
+
+  it('changes no decision it does not explain', () => {
+    const undeclared = CHARACTERISATION.filter((row) => row.base !== row.now && !row.divergence);
+    expect(undeclared.map((row) => row.name)).toEqual([]);
+    // And the ones that do diverge are exactly the deliberate ones.
+    expect(CHARACTERISATION.filter((row) => row.divergence).map((row) => row.name)).toEqual([
+      'empty_response after a proxy 503 replay storm',
+      'session_unavailable, whose prose reads transient',
+      'an unknown kind, even with a 5xx and transient prose',
+    ]);
+  });
+
+  it('matches transient prose on the raw text, not on the sanitized message', async () => {
+    // Sanitizing flattened the newline to a space, which would turn a phrase the base read as two
+    // unrelated words into `connection reset` and start replaying a failure nobody replayed before.
+    prompt.mockRejectedValue(internal({ message: 'connection\nreset by peer' }));
+
+    const rejection = await executor.execute(CONTENT).catch((e: unknown) => e);
+
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect((rejection as AcpError).message).toBe('Internal error: connection reset by peer');
+  });
+
+  it('shows data.message in the retry banner and the final error, not raw JSON', async () => {
+    prompt.mockRejectedValue(internal({ message: 'upstream request failed', error_kind: 'api', http_status: 503 }));
+
+    const rejection = await executor.execute(CONTENT).catch((e: unknown) => e);
+
+    const signals = (host.callbacks.onSignal as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    const banner = signals.find((s) => s.type === 'error');
+    expect(banner.message).toBe('Internal error: upstream request failed — retrying (1/3)');
+    expect((rejection as AcpError).message).toBe('Internal error: upstream request failed');
   });
 });

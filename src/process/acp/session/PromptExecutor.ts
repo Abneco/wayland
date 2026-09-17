@@ -4,7 +4,7 @@ import type { AcpMetrics } from '@process/acp/metrics/AcpMetrics';
 import type { AuthNegotiator } from '@process/acp/session/AuthNegotiator';
 import type { MessageTranslator } from '@process/acp/session/MessageTranslator';
 import { PromptTimer } from '@process/acp/session/PromptTimer';
-import { describeFuigoBudgetStop, extractFuigoPromptUsage } from '@process/agent/fuigo/launch';
+import { describeFuigoBudgetStop, describeFuigoTurnStop, extractFuigoPromptUsage } from '@process/agent/fuigo/launch';
 import { randomUUID } from 'node:crypto';
 import type { SessionLifecycle } from '@process/acp/session/SessionLifecycle';
 import type { AgentConfig, PromptContent, SessionCallbacks, SessionStatus } from '@process/acp/types';
@@ -56,11 +56,58 @@ const REPLAYABLE_PROMPT_CODES: ReadonlySet<AcpErrorCode> = new Set(['AGENT_INTER
  * CLOSED — the worst case is an error the user must retry by hand, which is
  * exactly where they were before #774.
  *
- * Matched against `acpErr.message`, into which `withErrorDetail` JSON-stringifies
- * the provider's `data`, so both prose and machine-readable codes land here.
+ * Matched against `acpErr.rawMessage` — the message as it read BEFORE an object `data` was rendered as
+ * `data.message` — so both prose and machine-readable codes land here on exactly the characters they
+ * landed on before typed data existed. Matching the sanitized message instead would widen it: flattening
+ * a newline turns `connection\nreset` into `connection reset` and starts replaying a failure that was
+ * always final.
  */
 const TRANSIENT_DETAIL =
   /\b5\d\d\b|connection\s+(error|reset|closed|refused)|econnreset|econnrefused|epipe|etimedout|econnaborted|eai_again|socket\s+hang\s*up|timed?\s*out|timeout|overloaded|temporarily\s+unavailable|service\s+unavailable|\bunavailable\b|try\s+again|upstream\s+(connect\s+)?(error|disconnect)|internal\s+server\s+error|had\s+an\s+error\s+while\s+processing|fetch\s+failed|network\s+error|bad\s+gateway|premature\s+close|other\s+side\s+closed|stream\s+(closed|disconnected)/i;
+
+/**
+ * `data.error_kind` values that are a transient condition all by themselves: the model went quiet, and the
+ * same prompt sent again is a genuinely different roll.
+ */
+const TRANSIENT_ERROR_KINDS: ReadonlySet<string> = new Set(['idle_timeout']);
+
+/**
+ * Kinds that say only HOW the call failed, not what the verdict was: `api` is any non-2xx from the provider,
+ * `http` any transport fault, `compaction` a failure of the summariser call Fuigo makes to recover from a
+ * full context. They carry no judgement of their own, so they are decided the way the identical failure was
+ * decided before typed data existed — transient prose, or a 5xx.
+ *
+ * `compaction` belongs here because it does not describe the PROMPT: it says the recovery attempt failed, and
+ * whether that was an idle timeout, a reset socket, a 503 from the summariser or "nothing to compact" is in
+ * the text, which is exactly what decided it on 1.0.17 when the same failure arrived untyped. The summariser
+ * is a DIFFERENT request from the prompt, so sending the turn again is a different roll — not the identical
+ * resend that `empty_response` exists to stop. Leaving it out ended the turn on the first blip, which is the
+ * #774 experience this whole replay loop was written to remove.
+ */
+const STATUS_REPORTING_ERROR_KINDS: ReadonlySet<string> = new Set(['api', 'http', 'compaction']);
+
+/**
+ * Typed failures (Fuigo 1.0.18 `data.error_kind` / `data.http_status`) are decided by those fields rather than
+ * by whatever their prose happens to say, and the list is an allowlist like the one above: `idle_timeout`
+ * replays; `api` / `http` / `compaction` replay exactly as that same failure replayed before this typing
+ * existed. Every other kind is FINAL, including ones whose prose reads transient — `empty_response` (the
+ * defect this exists for: an identical resend is served the same empty reply), `rate_limited`, `auth`,
+ * `cancelled`, `session_unavailable`, `max_tokens_truncation`, `doom_loop_detected` — and so is any kind this
+ * client has never heard of.
+ *
+ * Untyped failures (a bare string `data`, or an object carrying neither field) keep the prose match they
+ * always had. `{ message, http_status }` with no kind is Fuigo <= 1.0.17: prose decides, and any 5xx
+ * replays, which is what its JSON did when the status was still part of the matched text.
+ */
+function isTransientPromptFailure(acpErr: AcpError): boolean {
+  const { errorKind, httpStatus } = acpErr;
+  if (errorKind !== undefined) {
+    if (TRANSIENT_ERROR_KINDS.has(errorKind)) return true;
+    if (!STATUS_REPORTING_ERROR_KINDS.has(errorKind)) return false;
+  }
+  if (httpStatus !== undefined && httpStatus >= 500 && httpStatus <= 599) return true;
+  return TRANSIENT_DETAIL.test(acpErr.rawMessage ?? acpErr.message);
+}
 
 /**
  * Hang protection for ONE tool call. A running tool is progress however quiet it
@@ -253,6 +300,14 @@ export class PromptExecutor {
             });
           }
         }
+
+        // Fuigo 1.0.19 reports a `--max-turns` stop as a NORMAL result
+        // (`stopReason: "cancelled"` + `_meta.cancellationCategory`), not as an
+        // error, so say why the turn ended instead of leaving it blank.
+        if (this.host.agentConfig.agentBackend === 'fuigo') {
+          const turnStop = describeFuigoTurnStop(result);
+          if (turnStop) this.host.enterError(turnStop);
+        }
         break;
       } catch (err) {
         this.stopTurnTimers();
@@ -335,7 +390,7 @@ export class PromptExecutor {
     // NOT `acpErr.retryable`: that flag was tuned for session start/resume, a
     // different decision. Replaying a PROMPT is its own judgement call.
     if (!REPLAYABLE_PROMPT_CODES.has(acpErr.code)) return false;
-    if (!TRANSIENT_DETAIL.test(acpErr.message)) return false;
+    if (!isTransientPromptFailure(acpErr)) return false;
     return true;
   }
 

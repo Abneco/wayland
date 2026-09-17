@@ -145,6 +145,7 @@ import {
   buildFuigoAcpArgs,
   buildFuigoSessionMetadata,
   describeFuigoBudgetStop,
+  describeFuigoTurnStop,
   extractFuigoPromptUsage,
   fuigoBudgetEnv,
   fuigoCompatIsolationEnv,
@@ -293,8 +294,93 @@ describe('launch helpers', () => {
     );
     expect(describeFuigoBudgetStop({ data: { partial: false, reason: 'Turn returned normally' } })).toBeNull();
     expect(describeFuigoBudgetStop({ data: 'Execution state unavailable' })).toBeNull();
+    expect(
+      describeFuigoBudgetStop({ data: { message: 'empty response from model', error_kind: 'empty_response' } })
+    ).toBeNull();
+  });
+
+  it('recognises the 1.0.19 max-turns stop, which is a normal result and not an error', () => {
+    // Measured on the staged 1.0.19 with `--max-turns 1`.
+    expect(
+      describeFuigoTurnStop({ stopReason: 'cancelled', _meta: { cancellationCategory: 'max_turns_reached' } })
+    ).toMatch(/^Stopped by the turn limit/);
+    // A user-pressed Stop is the same stopReason with no category: it must stay silent.
+    expect(describeFuigoTurnStop({ stopReason: 'cancelled', _meta: { sessionId: 's' } })).toBeNull();
+    expect(describeFuigoTurnStop({ stopReason: 'cancelled' })).toBeNull();
+    expect(
+      describeFuigoTurnStop({ stopReason: 'end_turn', _meta: { cancellationCategory: 'max_turns_reached' } })
+    ).toBeNull();
+    expect(describeFuigoTurnStop(null)).toBeNull();
+  });
+
+  it('recognises the typed budget-stop shapes Fuigo 1.0.18+ sends (measured on the staged 1.0.19)', () => {
+    // -32602: `data` used to be the bare budget string; it is now an object.
+    const wall = { message: 'execution budget: wall deadline exhausted', error_kind: 'invalid_request' };
+    expect(describeFuigoBudgetStop({ code: -32602, message: 'Invalid params', data: wall })).toMatch(/60-minute limit/);
+    expect(describeFuigoBudgetStop({ cause: { data: wall } })).toMatch(/60-minute limit/);
+    expect(
+      describeFuigoBudgetStop({
+        data: { message: 'execution budget: model dispatch limit exhausted', error_kind: 'invalid_request' },
+      })
+    ).toMatch(/200 of its model calls/);
+    // -32603: the receipt keeps `partial`/`reason` and gains `message`/`error_kind`.
+    const receipt = {
+      partial: true,
+      pending_tool_calls: [],
+      reason: 'Execution stopped with bounded capacity or unresolved work. …',
+      message: 'Execution stopped with bounded capacity or unresolved work. …',
+      error_kind: 'execution_incomplete',
+    };
+    expect(describeFuigoBudgetStop({ code: -32603, message: 'Internal error', data: receipt })).toMatch(
+      /200 of its model calls before it finished/
+    );
     expect(describeFuigoBudgetStop(new Error('boom'))).toBeNull();
     expect(describeFuigoBudgetStop(null)).toBeNull();
+  });
+
+  /**
+   * Fuigo's terminal error `data` became an object on 1.0.18: the wall-budget stop that 1.0.16
+   * answered as the bare string `execution budget: wall deadline exhausted`
+   * (`acp_agent.rs:950-954`, `acp::Error::invalid_params().data(WALL_LIMIT)`) is now
+   * `acp_error::invalid_params(WALL_LIMIT)`, i.e.
+   * `{ message: 'execution budget: wall deadline exhausted', error_kind: 'invalid_request' }`.
+   * Wayland pins 1.0.16 today (`scripts/fuigo/authority.json`) and must read BOTH engines, so all
+   * three shapes have to resolve to the same copy — otherwise an unattended run that hit its wall
+   * budget shows the generic engine-failure banner with no explanation.
+   */
+  it('reads the budget stop from a typed 1.0.18 object as well as a 1.0.16 string and a receipt', () => {
+    // 1.0.16: bare string data.
+    expect(describeFuigoBudgetStop({ data: 'execution budget: wall deadline exhausted' })).toMatch(/60-minute limit/);
+    // 1.0.18: the same stop, typed.
+    expect(
+      describeFuigoBudgetStop({
+        data: { message: 'execution budget: wall deadline exhausted', error_kind: 'invalid_request' },
+      })
+    ).toMatch(/60-minute limit/);
+    // ...including when the ACP layer wrapped it, as PromptExecutor hands it over.
+    expect(
+      describeFuigoBudgetStop({
+        cause: { data: { message: 'execution budget: model dispatch limit exhausted', error_kind: 'invalid_request' } },
+      })
+    ).toMatch(/200 of its model calls/);
+    // The call-budget receipt keeps its own branch, untouched.
+    expect(
+      describeFuigoBudgetStop({
+        data: { partial: true, reason: 'Execution stopped with bounded capacity or unresolved work. …' },
+      })
+    ).toMatch(/200 of its model calls/);
+    // Still anchored: a budget string that reached the client wrapped in another error's prose
+    // (`SamplingError::InvalidConfiguration` renders as `invalid client configuration: <text>`)
+    // is not a budget stop verdict, and no other typed failure is one either.
+    expect(
+      describeFuigoBudgetStop({
+        data: {
+          message: 'invalid client configuration: execution budget: model dispatch limit exhausted',
+          error_kind: 'api',
+        },
+      })
+    ).toBeNull();
+    expect(describeFuigoBudgetStop({ data: { message: 'connection reset by peer', error_kind: 'http' } })).toBeNull();
   });
 
   it('shares one engine home across conversations', () => {

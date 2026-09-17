@@ -174,13 +174,15 @@ export function buildFuigoAcpArgs(opts: { trusted: boolean; maxTurns?: number })
  * process (`fuigo-sampler/src/execution_budget.rs`; positive integers; the
  * wall clock starts at process init and both are aggregate across every
  * session, model switch, subagent and side call in that process). Verified on
- * the staged 1.0.15 over stdio:
+ * the staged 1.0.15 and again on 1.0.19 over stdio:
  *   - calls: the last admission is reserved for a final answer, then the
  *     prompt returns `-32603` whose `data` is the execution receipt
- *     (`partial: true`, `reason: "Execution stopped with bounded capacity …"`).
+ *     (`partial: true`, `reason: "Execution stopped with bounded capacity …"`;
+ *     1.0.18+ adds `message` = reason and `error_kind: "execution_incomplete"`).
  *   - wall: a prompt past the deadline returns `-32602` with
- *     `data: "execution budget: wall deadline exhausted"`; a running turn is
- *     cancelled. The process stays alive either way.
+ *     `data: "execution budget: wall deadline exhausted"` up to 1.0.17 and
+ *     `data: {message: <that string>, error_kind: "invalid_request"}` from
+ *     1.0.18; a running turn is cancelled. The process stays alive either way.
  * A scheduled run is one process per run (the idle reaper SIGTERMs it), so a
  * per-process budget is a per-run budget. Core had no persisted keys for
  * these — its hard stops were fixed thresholds — so the defaults live here
@@ -208,9 +210,26 @@ const BUDGET_DATA = /^execution budget: (model dispatch limit|wall deadline) exh
  * The user-facing reason when a prompt failed because Fuigo hit a process
  * budget, or null for any other failure. Reads the JSON-RPC `data` of the
  * prompt error (walking `cause`, since the ACP layer wraps the SDK error).
+ *
+ * Fuigo's terminal error `data` carries the budget text in two shapes and both
+ * are live: 1.0.16 (the pinned engine, `scripts/fuigo/authority.json`) answers
+ * `acp::Error::invalid_params().data(WALL_LIMIT)` — a bare string — while
+ * 1.0.18 types every terminal error as an object
+ * (`acp_error::invalid_params(WALL_LIMIT)` -> `{ message, error_kind }`), the
+ * same shape `errorNormalize` reads elsewhere in this process. Matching only
+ * the string left a wall-budget stop on 1.0.18 showing the generic
+ * engine-failure banner with no explanation, so the budget text is matched
+ * wherever it is: `data`, or `data.message`.
  */
 export function describeFuigoBudgetStop(err: unknown): string | null {
   const minutes = Math.round(FUIGO_UNATTENDED_MAX_RUNTIME_SECS / 60);
+  const fromBudgetText = (text: string): string | null => {
+    const m = BUDGET_DATA.exec(text.trim());
+    if (!m) return null;
+    return m[1] === 'wall deadline'
+      ? `Stopped by the run budget: this run passed its ${minutes}-minute limit. Work finished before the stop is kept; the next run starts fresh.`
+      : `Stopped by the run budget: this run used all ${FUIGO_UNATTENDED_MAX_MODEL_CALLS} of its model calls. Work finished before the stop is kept; the next run starts fresh.`;
+  };
   for (
     let e: unknown = err, depth = 0;
     e && typeof e === 'object' && depth < 4;
@@ -218,22 +237,46 @@ export function describeFuigoBudgetStop(err: unknown): string | null {
   ) {
     const data = (e as { data?: unknown }).data;
     if (typeof data === 'string') {
-      const m = BUDGET_DATA.exec(data.trim());
-      if (m) {
-        return m[1] === 'wall deadline'
-          ? `Stopped by the run budget: this run passed its ${minutes}-minute limit. Work finished before the stop is kept; the next run starts fresh.`
-          : `Stopped by the run budget: this run used all ${FUIGO_UNATTENDED_MAX_MODEL_CALLS} of its model calls. Work finished before the stop is kept; the next run starts fresh.`;
-      }
+      const stop = fromBudgetText(data);
+      if (stop) return stop;
       continue;
     }
     if (data && typeof data === 'object') {
-      const r = data as { partial?: unknown; reason?: unknown };
+      const r = data as { partial?: unknown; reason?: unknown; message?: unknown };
+      if (typeof r.message === 'string') {
+        const stop = fromBudgetText(r.message);
+        if (stop) return stop;
+      }
       if (r.partial === true && typeof r.reason === 'string' && BUDGET_RECEIPT_REASON.test(r.reason)) {
         return `Stopped by the run budget: this run used all ${FUIGO_UNATTENDED_MAX_MODEL_CALLS} of its model calls before it finished. Work done so far is kept; the next run starts fresh.`;
       }
     }
   }
   return null;
+}
+
+/**
+ * The user-facing reason when a prompt ENDED NORMALLY because Fuigo stopped it,
+ * or null for an ordinary turn.
+ *
+ * Up to 1.0.18 the per-prompt `--max-turns` cap failed the prompt with
+ * `-32603`, so it arrived through `describeFuigoBudgetStop` above. From 1.0.19
+ * (`fuigo-shell` `turn.rs`, `TurnOutcome::MaxTurnsReached`) it is a normal
+ * result instead: `stopReason: "cancelled"` with
+ * `_meta.cancellationCategory: "max_turns_reached"` — measured on the staged
+ * 1.0.19 over stdio. Without this, that stop is indistinguishable from the
+ * user pressing Stop and the turn just ends blank.
+ *
+ * The process budgets (`FUIGO_MAX_MODEL_CALLS` / `FUIGO_MAX_RUNTIME_SECS`)
+ * still fail the prompt; they stay in `describeFuigoBudgetStop`.
+ */
+export function describeFuigoTurnStop(result: unknown): string | null {
+  if (!result || typeof result !== 'object') return null;
+  if ((result as { stopReason?: unknown }).stopReason !== 'cancelled') return null;
+  const meta = (result as { _meta?: unknown })._meta;
+  if (!meta || typeof meta !== 'object') return null;
+  if ((meta as { cancellationCategory?: unknown }).cancellationCategory !== 'max_turns_reached') return null;
+  return 'Stopped by the turn limit: this turn used all the agentic turns it was allowed. Work done so far is kept; send another message to continue.';
 }
 
 /**
