@@ -5,7 +5,6 @@
  */
 
 import path from 'node:path';
-import { homedir } from 'node:os';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { app, dialog } from 'electron';
 import type { ImportSummary, ImportItemResult } from '@/common/adapter/ipcBridge';
@@ -17,8 +16,11 @@ import { SkillLibrary } from '@process/services/skills/SkillLibrary';
 import { SkillImport, type ImportResult } from '@process/services/skills/SkillImport';
 import { SkillQuarantine } from '@process/services/skills/SkillQuarantine';
 import { importAgentProfile } from '@process/services/skills/agentProfileImport';
+import { enableSkillForCurrentAssistant } from '@process/services/skills/enableSkillForAssistant';
+import { withSkillFrontmatter } from '@process/services/skills/withSkillFrontmatter';
 import { parseFrontmatter } from '@process/task/AcpSkillManager';
-import { ProcessConfig, getAssistantsDir } from '@process/utils/initStorage';
+import { ProcessConfig, getAssistantsDir, getSkillsDir } from '@process/utils/initStorage';
+import { runLegacySkillsDirMigration } from '@process/utils/migrations/legacySkillsDirMigration';
 import { loadTeamSkills } from '@process/extensions/data/bundle-vendored/teamSkillMerge';
 import { loadCliSkills } from '@process/services/skills/CliSkillDiscovery';
 import { getDatabase } from '@process/services/database';
@@ -397,23 +399,37 @@ export function initSkillsBridge(): void {
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '');
 
+    // The document that will actually be on disk, frontmatter and all - so the
+    // guard reads exactly what is written, and what is quarantined is exactly
+    // what was refused.
+    const document = withSkillFrontmatter(body, { name: kebab, description, type: type ?? 'skill' });
+
     // C3: scan BEFORE writing. The previous flow wrote the body to
     // ~/.wayland/skills/<name>/SKILL.md, scanned it, and only skipped the
     // SkillLibrary registration when blocked - leaving the body permanently
     // on the user's filesystem. Now the body never lands in the live skills
     // tree until the verdict is known. Blocked content goes straight to
     // ~/.wayland/skills/.quarantine/<name>/SKILL.md instead.
-    const [report] = await SkillGuard.scan([{ name: kebab, body, description, tags }], { llm: true });
+    const [report] = await SkillGuard.scan([{ name: kebab, body: document, description, tags }], { llm: true });
 
     if (report.verdict === 'blocked') {
-      const quarantinedAt = await SkillQuarantine.quarantineFromMemory({ name: kebab, body });
+      const quarantinedAt = await SkillQuarantine.quarantineFromMemory({ name: kebab, body: document });
       return { name: kebab, verdict: report.verdict, quarantinedAt };
     }
 
-    const destDir = path.join(homedir(), '.wayland', 'skills', kebab);
+    // getSkillsDir(), NOT ~/.wayland/skills. The builder was the last writer
+    // still on the legacy path (the importer moved; see LEGACY_IMPORTED_DIR,
+    // "retained only so an older install can still be found"), and that path is
+    // a DIFFERENT TREE: the skills dir hangs off the CONFIG root
+    // (~/.wayland-config, ~/.config/Wayland/config), not the data root
+    // ~/.wayland. Every reader - AcpSkillManager.discoverSkills,
+    // fs.listAvailableSkills, initAgent's workspace staging - scans
+    // getSkillsDir(), so a skill written to the old path was registered in the
+    // library, listed in the Skill Manager, and invisible to every engine (#1190).
+    const destDir = path.join(getSkillsDir(), kebab);
     await mkdir(destDir, { recursive: true });
     const destFile = path.join(destDir, 'SKILL.md');
-    await writeFile(destFile, body, 'utf-8');
+    await writeFile(destFile, document, 'utf-8');
 
     SkillLibrary.getInstance().registerSource([
       {
@@ -427,7 +443,35 @@ export function initSkillsBridge(): void {
       },
     ]);
 
+    // Switch it on for the assistant the user is about to chat with, the same
+    // way an import does. Nothing else in main mutates `enabledSkills`, so a
+    // skill the user just built stayed switched off until they went and found
+    // it in Settings - and starring it is not enablement. Skills only: a
+    // workflow is not something an assistant carries in `enabledSkills`.
+    // Failure must never fail the save; the skill is on disk and registered.
+    if ((type ?? 'skill') === 'skill') {
+      await enableSkillForCurrentAssistant(kebab);
+    }
+
     return { name: kebab, verdict: report.verdict };
+  });
+
+  // One-time: copy skills stranded in the legacy ~/.wayland/skills tree into
+  // getSkillsDir(), so upgrading fixes the skill the user ALREADY made and not
+  // just the next one (#1190). Copies, never moves - see the module header.
+  //
+  // Driven from here rather than from initStorage's migration block, where its
+  // two siblings live, because it needs `parseFrontmatter` to decide whether a
+  // stranded SKILL.md is usable, and AcpSkillManager imports initStorage - the
+  // import would close a module cycle. It follows the same shape as those
+  // siblings otherwise: a module under utils/migrations, an injected store, and
+  // a `migration.*` flag as the gate.
+  //
+  // Fire-and-forget for the same reason as the sweep below: nothing here may
+  // delay boot, and the config-flag gate makes every later launch a no-op with
+  // no filesystem call at all.
+  void runLegacySkillsDirMigration(ProcessConfig).catch((err) => {
+    console.warn('[skillsBridge] legacy skills migration failed', err);
   });
 
   // C4: one-time library sweep on app start. The 2,054 vendored skills seed as
